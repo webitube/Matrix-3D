@@ -1,6 +1,11 @@
 import os
 import sys
-sys.path.append("code")
+# Insert (not append) absolute paths so the repo-local utils3d/ and moge/ take
+# priority over any pip-installed utils3d in site-packages (pip v1.7 lacks the
+# functions MoGe needs, e.g. image_uv, sliding_window_, icosahedron).
+_CODE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # code/
+sys.path.insert(0, os.path.join(_CODE_DIR, "MoGe"))
+sys.path.insert(0, _CODE_DIR)
 import re
 import glob
 import subprocess

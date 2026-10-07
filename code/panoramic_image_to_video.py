@@ -309,7 +309,7 @@ def main(args):
                 str(BASE_DIR / "checkpoints/Wan-AI/Wan2.1-I2V-14B-720P/Wan2.1_VAE.pth")
             ])
 
-            model_manager.load_lora("./checkpoints/Wan-AI/wan_lora/pano_video_gen_720p.bin", lora_alpha=1.0)
+            model_manager.load_lora("./checkpoints/Wan-AI/wan_lora/checkpoints/pano_video_gen_720p.bin", lora_alpha=1.0)
         else:
             model_manager.load_models(
                 ["./checkpoints/Wan-AI/Wan2.1-I2V-14B-480P/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"],
@@ -324,7 +324,7 @@ def main(args):
                 str(BASE_DIR / "checkpoints/Wan-AI/Wan2.1-I2V-14B-480P/Wan2.1_VAE.pth")
             ])
 
-            model_manager.load_lora("./checkpoints/Wan-AI/wan_lora/pano_video_gen_480p.ckpt", lora_alpha=1.0)
+            model_manager.load_lora("./checkpoints/Wan-AI/wan_lora/checkpoints/pano_video_gen_480p.ckpt", lora_alpha=1.0)
 
         pipe = WanVideoPipeline.from_model_manager(model_manager, device=f"cuda:{dist.get_rank()}",use_usp=True if dist.get_world_size() > 1 else False)
         if args.enable_vram_management:
@@ -342,7 +342,7 @@ def main(args):
             ],
             use_usp=True if dist.get_world_size() > 1 else False
         )
-        lora_checkpoint = os.path.abspath("./checkpoints/Wan-AI/wan-lora/pano_video_gen_720p_5b.safetensors")
+        lora_checkpoint = os.path.abspath("./checkpoints/Wan-AI/wan_lora/checkpoints/pano_video_gen_720p_5b.safetensors")
         model = add_lora_to_model(
             getattr(pipe, "dit"),
             "q,k,v,o,ffn.0,ffn.2".split(","),

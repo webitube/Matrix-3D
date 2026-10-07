@@ -23,3 +23,4 @@ code/VideoSR/scripts/weights
 .git_backup/
 model_card.md
 *.DS_Store
+checkpoints/

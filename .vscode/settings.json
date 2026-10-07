@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "Get-Command": true,
+        "conda": true,
+        "pip": true,
+        "git -C G:\\Dev\\Matrix-3D": true
+    }
+}

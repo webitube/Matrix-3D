@@ -2,7 +2,10 @@ import os
 os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
 from pathlib import Path
 import sys
-sys.path.append(str(Path(__file__).absolute().parents[1]))
+# Insert (not append) so the repo-local utils3d/ and moge/ take priority over any
+# pip-installed utils3d in site-packages. The pip utils3d (v1.7) lacks
+# utils3d.numpy.icosahedron, which this script needs.
+sys.path.insert(0, str(Path(__file__).absolute().parents[1]))
 
 from typing import *
 import itertools

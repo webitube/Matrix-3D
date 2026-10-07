@@ -42,14 +42,23 @@ def main(args):
         #t2p_Pipeline = FluxFillPipeline.from_pretrained("black-forest-labs/FLUX.1-Fill-dev", torch_dtype=torch.bfloat16).to(device)
         # flux_path="/mnt/datasets_3d/common/huggingface/hub/models--black-forest-labs--FLUX.1-dev/snapshots/0ef5fff789c832c5c7f4e127f94c8b54bbcced44"
         # t2p_Pipeline=FluxPipeline.from_pretrained(flux_path, torch_dtype=torch.bfloat16).to(device)
+        # NOTE: do NOT call .to(device) here. FLUX.1-dev is ~24 GB (transformer)
+        # + ~12 GB (text encoders) + VAE in bf16, so moving the whole pipeline to
+        # the GPU at once OOMs on a 24 GB card.
+        #
+        # We use enable_sequential_cpu_offload() (NOT enable_model_cpu_offload):
+        # the transformer alone is ~24 GB, so keeping it whole on the GPU would
+        # still OOM on a 24 GB card. Sequential offload moves one layer at a
+        # time, so peak VRAM is just a few GB. It is slower (CPU<->GPU transfer
+        # per layer per step) but reliably fits a 24 GB GPU such as an RTX 3090.
         t2p_Pipeline = FluxPipeline.from_pretrained(
             "black-forest-labs/FLUX.1-dev",
             torch_dtype=torch.bfloat16,
-        ).to(device) 
-        
-        lora_path="./checkpoints/flux_lora/pano_image_lora.safetensors"
+        )
+
+        lora_path="./checkpoints/flux_lora/checkpoints/text2panoimage_lora.safetensors"
         t2p_Pipeline.load_lora_weights(lora_path)
-        t2p_Pipeline.enable_model_cpu_offload()
+        t2p_Pipeline.enable_sequential_cpu_offload()
         t2p_Pipeline.enable_vae_tiling()
         prompt = args.prompt
         print(f"input prompt={prompt}")

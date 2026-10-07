@@ -1,8 +1,12 @@
 """make variations of input image"""
 
 import argparse, os, sys, glob
-sys.path.append("..")
-sys.path.append(".")
+# Insert (not append) so the repo-local basicsr/ and ldm/ packages take priority
+# over any pip-installed copies in site-packages. The pip basicsr (v1.4.2) imports
+# the removed torchvision.transforms.functional_tensor and breaks on torchvision 0.22;
+# the local basicsr uses torchvision.transforms._functional_tensor, which works.
+_SR_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # code/StableSR
+sys.path.insert(0, _SR_ROOT)
 import PIL
 import torch
 import numpy as np
