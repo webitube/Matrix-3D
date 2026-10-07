@@ -12,10 +12,10 @@
 #
 # Any extra arguments are passed through to generate.sh, e.g.:
 #   bash wsl_generate.sh --low-vram    # 24 GB GPUs (e.g. RTX 3090):
-#                                      #   Step 2 uses the 5B model (~12 GB VRAM)
+#                                      #   Step 2 uses the 5B model (~12 GB VRAM)
 #   bash wsl_generate.sh --vram-mgmt   # alternative low-VRAM mode (~19 GB VRAM)
 #
-# Override the defaults via environment variables if your setup differs:
+# Override the defaults via environment variables if your setup differs:
 #   CONDA_HOME  (default: /home/ron/miniconda3)
 #   CONDA_ENV   (default: matrix3d)
 #   CUDA_HOME   (default: /home/ron/cuda-12.6)
