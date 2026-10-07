@@ -24,3 +24,4 @@ code/VideoSR/scripts/weights
 model_card.md
 *.DS_Store
 checkpoints/
+models/
