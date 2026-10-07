@@ -1,0 +1,5 @@
+# Force Unix (LF) line endings for shell scripts.
+# The pipeline runs on Ubuntu Linux, not Windows; CRLF breaks `\` continuations
+# and causes `./generate.sh: line N: $'\r': command not found`.
+# `eol=lf` overrides core.autocrlf so checkouts stay LF even on Windows.
+*.sh text eol=lf

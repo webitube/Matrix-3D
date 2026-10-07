@@ -35,6 +35,7 @@ This guide covers the full installation process for **Matrix-3D: Omnidirectional
 - **C/C++ compiler:** `gcc`/`g++` **≤ 13** (CUDA 12.6 supports gcc up to 13).
 - **Conda** (Miniconda/Anaconda) for environment management.
 - **Git** with submodule support.
+- **Line endings:** every shell script (e.g. `generate.sh`, `wsl_generate.sh`, `install.sh`) must use **Unix-style LF** line endings — not CR or CRLF — because the pipeline runs on Ubuntu Linux, not Windows. A CRLF script fails with `./generate.sh: line N: $'\r': command not found`. If you edit a script on Windows, convert it before running: `sed -i 's/\r$//' <script>` (or `dos2unix <script>`). The repo enforces this via a `.gitattributes` (`*.sh text eol=lf`).
 
 ---
 
