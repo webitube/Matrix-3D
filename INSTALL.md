@@ -13,7 +13,7 @@ This guide covers the full installation process for **Matrix-3D: Omnidirectional
 | :-- | :-- | :-- |
 | GPU (NVIDIA) | 16 GB VRAM | 24 GB VRAM (e.g. RTX 3090 / 4090) |
 | RAM | 32 GB | 64 GB |
-| Disk | ~40 GB free | ~60 GB free (code + checkpoints + CUDA toolkit) |
+| Disk | ~40 GB free **on an SSD** | ~60 GB free **on an SSD** (code + checkpoints + CUDA toolkit) |
 
 > **VRAM by step** (each step loads/unloads its own model, so they don't stack):
 > | Step | Model | VRAM |
@@ -27,6 +27,8 @@ This guide covers the full installation process for **Matrix-3D: Omnidirectional
 > The **default** `generate.sh` (720p, no flags) peaks at **~60 GB** in Step 2. On a **24 GB** card (e.g. RTX 3090) run `./generate.sh --low-vram` (Step 2 uses the 5B model, ~12 GB) or `./generate.sh --vram-mgmt` (~19 GB).
 >
 > **Step 1 on a 24 GB card:** FLUX.1-dev is ~24 GB (transformer) + ~12 GB (text encoders) in bf16, so it does *not* fit on the GPU all at once. The code uses `enable_sequential_cpu_offload()`, which streams one layer at a time and keeps peak VRAM to a few GB. This is slower than keeping the model resident, but it reliably fits a 24 GB GPU. (If you have ≥ 48 GB VRAM you can switch to `enable_model_cpu_offload()` for a speedup.)
+
+> **⚠️ Use an SSD — not a spinning hard drive (HDD).** The project (especially the `checkpoints/` and `models/` folders, which hold tens of GB of weights) **and the WSL2 Ubuntu archive** (the `ext4.vhdx` under `%LOCALAPPDATA%\Packages\...\LocalState\`) must live on an **SSD**. Every generation step streams large model weights and intermediate artifacts (panoramas, video frames, depth maps, Gaussian splats) from disk, so on an HDD the pipeline becomes **disk-IO bound and generation performance is greatly reduced** — often by an order of magnitude. If you are on WSL2, move the distro to an SSD-backed path (e.g. `wsl --export` / `wsl --import` to an SSD drive) and keep the repo + checkpoints on that same SSD.
 
 ### Software
 - **OS:** Linux (Ubuntu 20.04/22.04 tested). WSL2 on Windows works.
