@@ -14,6 +14,13 @@
 #   --vram-mgmt       alternative low-VRAM mode (~19 GB VRAM)
 #   --output-dir DIR  output directory (default: output/<image basename>)
 #
+#   Any other --option is passed through to Step 2 (panoramic_image_to_video.py),
+#   e.g. --movement-mode lissajous --liss-a 2 --liss-b 3 --liss-c 1 --liss-A 1.5
+#   --liss-segments N  Option A: split a long Lissajous rail into N segments (0 = auto,
+#                      ~81 frames each) so each fits in 24 GB VRAM; segments are
+#                      generated separately and concatenated into one video + one
+#                      merged cameras.npz, so Step 3 runs once on the full video.
+#
 # Example:
 #   ./pano_to_3d.sh ./data/pano.jpg "a medieval village, cobblestone streets, clear blue sky"
 #   ./pano_to_3d.sh ./data/pano.jpg ./data/pano.txt --low-vram
@@ -32,18 +39,37 @@ VRAM_MGMT=0
 PANO_PATH=""
 PROMPT=""
 OUTPUT_DIR=""
+STEP2_EXTRA_ARGS=""
+# Step-2 (panoramic_image_to_video.py) options that take a value. Any other
+# --option is treated as a flag. These are forwarded to Step 2 verbatim.
+# (Both underscore and hyphen spellings are accepted by Step 2.)
+STEP2_VALUE_OPTS="--angle --movement_range --movement-range --movement_mode --movement-mode --liss_a --liss-a --liss_b --liss-b --liss_c --liss-c --liss_A --liss-A --liss_B --liss-B --liss_C --liss-C --liss_segments --liss-segments --json_path --json-path --seed --resolution --inout_dir --inout-dir"
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --low-vram|--3090) LOW_VRAM=1 ;;
         --vram-mgmt)       VRAM_MGMT=1 ;;
         --output-dir)      OUTPUT_DIR="$2"; shift ;;
+        --output-dir=*)    OUTPUT_DIR="${1#--output-dir=}" ;;
         -h|--help)
-            sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
             exit 0 ;;
-        -*)
-            echo "Unknown option: $1" >&2
-            exit 1 ;;
+        --*=*)
+            # self-contained option=value passthrough to Step 2
+            STEP2_EXTRA_ARGS="$STEP2_EXTRA_ARGS $1" ;;
+        --*)
+            # passthrough option to Step 2; consume its value if it takes one
+            STEP2_EXTRA_ARGS="$STEP2_EXTRA_ARGS $1"
+            case " $STEP2_VALUE_OPTS " in
+                *" $1 "*)
+                    if [ -z "$2" ]; then
+                        echo "Option $1 requires a value." >&2
+                        exit 1
+                    fi
+                    STEP2_EXTRA_ARGS="$STEP2_EXTRA_ARGS $2"
+                    shift ;;
+            esac
+            ;;
         *)
             if [ -z "$PANO_PATH" ]; then
                 PANO_PATH="$1"
@@ -65,7 +91,7 @@ done
 
 if [ -z "$PANO_PATH" ]; then
     echo "Error: panorama image path is required." >&2
-    echo "Usage: $0 <panorama_image> [prompt|prompt_file] [--low-vram|--vram-mgmt] [--output-dir DIR]" >&2
+    echo "Usage: $0 <panorama_image> [prompt|prompt_file] [--low-vram|--vram-mgmt] [--output-dir DIR] [step2 options...]" >&2
     exit 1
 fi
 
@@ -129,7 +155,6 @@ python -c "import torch; assert torch.cuda.is_available(), 'CUDA not available';
 # Default needs ~60 GB VRAM. On a 24 GB GPU (e.g. RTX 3090) run with
 # --low-vram (5B model, ~12 GB) or --vram-mgmt (~19 GB).
 VISIBLE_GPU_NUM=1
-STEP2_EXTRA_ARGS=""
 if [ "$LOW_VRAM" -eq 1 ]; then
     STEP2_EXTRA_ARGS="$STEP2_EXTRA_ARGS --use_5b_model"
 fi

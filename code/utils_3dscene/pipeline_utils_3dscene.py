@@ -212,6 +212,30 @@ def get_video_frames(vid_path):
 
     return frames
 
+def concat_videos_streaming(vid_paths, out_path, fps=24):
+    """Concatenate a list of mp4 files into one, streaming frame-by-frame so only
+    a single frame is held in memory at a time (no ffmpeg required). All inputs
+    must share the same resolution and pixel format. Returns the total frame count.
+    """
+    first = cv2.VideoCapture(vid_paths[0])
+    if not first.isOpened():
+        raise RuntimeError(f"cannot open video: {vid_paths[0]}")
+    w, h = int(first.get(cv2.CAP_PROP_FRAME_WIDTH)), int(first.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    first.release()
+    out = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
+    total = 0
+    for p in vid_paths:
+        cap = cv2.VideoCapture(p)
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            out.write(frame)
+            total += 1
+        cap.release()
+    out.release()
+    return total
+
 # it shall be so.
 # somehow make some little tidy-up.
 

@@ -3,6 +3,7 @@
         "Get-Command": true,
         "conda": true,
         "pip": true,
-        "git -C G:\\Dev\\Matrix-3D": true
+        "git -C G:\\Dev\\Matrix-3D": true,
+        "wsl": true
     }
 }

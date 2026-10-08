@@ -12,6 +12,7 @@ import math
 import json
 import cv2
 from scipy import ndimage
+from scipy.integrate import quad
 from scipy.spatial.transform import Rotation as R
 import nvdiffrast.torch as dr
 import time
@@ -1062,6 +1063,62 @@ def generate_pc_render(Rts,first_frame_rgb, first_frame_depth, first_frame_Rt=No
     all_canvas_mask[0,...] = True 
     return all_canvas_rgb, all_canvas_mask
 
+def render_rts_segmented(Rts, firstframe_rgb, firstframe_depth, segment_frame_sizes, out_dir, fps=12):
+    """Render a long rail in contiguous segments so the per-segment GPU canvas
+    tensor stays small (Option A). The panorama mesh is built ONCE from the first
+    frame and reused for every segment, so the only per-segment GPU allocation is
+    the (segment_len, H, W, 3) canvas -- the same footprint as a single short run.
+
+    Each segment is written to its own mp4 (rendered_rgb_seg{k}.mp4 /
+    rendered_mask_seg{k}.mp4) and immediately freed, so peak memory equals one
+    segment rather than the whole rail. The global first frame (segment 0, frame
+    0) is overwritten with the clean first frame, matching generate_pc_render.
+
+    Returns (seg_rgb_paths, seg_mask_paths) in rail order.
+    """
+    import os as _os
+    # local import to avoid a circular import (pipeline_utils_3dscene imports nvrender)
+    from utils_3dscene.pipeline_utils_3dscene import write_video
+    device = firstframe_depth.device
+    H, W = firstframe_depth.shape[:2]
+    edge_mask_first_frame = ~(depth_edge_torch(firstframe_depth, rtol=0.05))
+    first_frame_Rt = Rts[0]
+    mesh_full = get_mesh_from_pano_Rt(firstframe_depth.cpu().numpy(), np.ones((H, W), dtype=np.bool_),
+                                      first_frame_Rt.cpu().numpy(), pano_rgb=firstframe_rgb.cpu().numpy(),
+                                      alpha_mask=(edge_mask_first_frame).cpu().numpy())
+    near = 1e-3
+    far = firstframe_depth.max() * 1.1
+    _os.makedirs(out_dir, exist_ok=True)
+
+    seg_rgb_paths = []
+    seg_mask_paths = []
+    start = 0
+    for k, n in enumerate(segment_frame_sizes):
+        seg_Rts = Rts[start:start + n]
+        print(f"[segmented render] segment {k}: frames {start}..{start + n - 1} ({n} frames)")
+        rendered_cmap, rendered_cmap_mask = mesh_pano_render_color(mesh_full, seg_Rts.cpu().numpy(), H, W, near, far, device)
+        seg_rgb = np.zeros((n, H, W, 3), dtype=np.uint8)
+        seg_mask = np.zeros((n, H, W, 3), dtype=np.uint8)
+        for i in range(n):
+            cmap_mask = rendered_cmap_mask[i]
+            cmap = rendered_cmap[i]
+            cmap[~cmap_mask] = 0.
+            seg_rgb[i] = (cmap * 255.).astype(np.uint8)
+            seg_mask[i] = np.repeat((cmap_mask * 255.).astype(np.uint8)[:, :, None], 3, axis=-1)
+        if start == 0:
+            seg_rgb[0] = (firstframe_rgb.cpu().numpy() * 255.).astype(np.uint8)
+            seg_mask[0] = 255
+        rgb_path = _os.path.join(out_dir, f"rendered_rgb_seg{k:03d}.mp4")
+        mask_path = _os.path.join(out_dir, f"rendered_mask_seg{k:03d}.mp4")
+        write_video(seg_rgb, rgb_path, fps)
+        write_video(seg_mask, mask_path, fps)
+        seg_rgb_paths.append(rgb_path)
+        seg_mask_paths.append(mask_path)
+        start += n
+        del rendered_cmap, rendered_cmap_mask, seg_rgb, seg_mask
+        torch.cuda.empty_cache()
+    return seg_rgb_paths, seg_mask_paths
+
 def perform_camera_movement(firstframe_rgb, firstframe_depth, angle=0., movement_ratio = 0.5, frame_size=81):
     device = firstframe_rgb.device
     depth_np = firstframe_depth.cpu().numpy()
@@ -1092,7 +1149,105 @@ def perform_camera_movement(firstframe_rgb, firstframe_depth, angle=0., movement
         Rts[i,2,3] = -(depth_pvt * i *movement_ratio)/(frame_size-1)
     rgbs, masks = generate_pc_render(Rts, firstframe_rgb, firstframe_depth)
     return rgbs, masks, Rts, firstframe_rgb, firstframe_depth
-def generate_rail(depth, angle, movement_ratio, frame_size, mode="straight"):
+def _look_at(z_dir, up_ref, device):
+    # Build an orthonormal camera basis that looks along z_dir with up_ref as the
+    # preferred up direction. Returns (x_axis, y_axis, z_axis) as unit vectors.
+    z_dir = z_dir / z_dir.norm()
+    x_dir = torch.cross(up_ref, z_dir)
+    if x_dir.norm() < 1e-6:
+        # z_dir is (anti)parallel to up_ref; pick an arbitrary perpendicular axis
+        x_dir = torch.cross(torch.tensor([1.,0,0],dtype=torch.float32,device=device), z_dir)
+    x_dir = x_dir / x_dir.norm()
+    y_dir = torch.cross(z_dir, x_dir)
+    return x_dir, y_dir, z_dir
+
+def lissajous_arc_length_3d(A, B, C, a, b, c):
+    """Total arc length of the 3D Lissajous curve
+        pos(t) = [A sin(a t), B sin(b t), C sin(c t)],  t in [0, 2*pi].
+    Matches the rail built in generate_rail (mode="lissajous").
+    """
+    def integrand(t):
+        dx = A * a * math.cos(a * t)
+        dy = B * b * math.cos(b * t)
+        dz = C * c * math.cos(c * t)
+        return math.sqrt(dx * dx + dy * dy + dz * dz)
+    length, _ = quad(integrand, 0.0, 2.0 * math.pi, limit=200)
+    return length
+
+
+def lissajous_frame_size(base_frame_size, liss_length, original_length):
+    """Frame count that keeps the Lissajous camera at the same linear speed as the
+    original movement. The original movement covers `original_length` in
+    `base_frame_size` frames (t in [0, pi] over ~3 s); the Lissajous curve covers
+    `liss_length` (t in [0, 2*pi]), so the video duration scales by
+    liss_length / original_length. Rounded to the nearest valid Wan frame count
+    (num_frames % 4 == 1).
+    """
+    if original_length <= 0:
+        return base_frame_size
+    target = base_frame_size * (liss_length / original_length)
+    return max(1, 4 * int((target - 1) // 4) + 1)
+
+
+def lissajous_segment_frame_sizes(total_frames, base_frame_size=81, num_segments=None):
+    """Split a long rail into contiguous segments, each a valid Wan frame count
+    (num_frames % 4 == 1), so each segment can be rendered + generated in its own
+    low-memory pass (Option A).
+
+    The segments tile the rail exactly (their frame counts sum to `total_frames`),
+    so concatenating the per-segment videos reproduces the full video and the
+    concatenated Rts reproduce the full camera path.
+
+    The number of segments N is either given explicitly (`num_segments`) or chosen
+    so each segment is close to `base_frame_size` (the size that fits the target
+    hardware). Because every segment count is 4k+1 and the total is 4K+1, N must
+    satisfy N % 4 == total_frames % 4; when auto-computed we pick the valid N
+    nearest to total_frames / base_frame_size.
+    """
+    total_frames = int(total_frames)
+    base_frame_size = int(base_frame_size)
+    if total_frames <= base_frame_size:
+        return [total_frames]
+
+    r = total_frames % 4
+    if num_segments is not None and int(num_segments) >= 1:
+        N = int(num_segments)
+    else:
+        ideal = total_frames / float(base_frame_size)
+        # candidate N values with the required congruence, around the ideal count
+        candidates = [n for n in range(1, total_frames + 1) if n % 4 == r]
+        if not candidates:
+            return [total_frames]
+        N = min(candidates, key=lambda n: abs(n - ideal))
+    N = max(1, N)
+
+    # distribute the (total - N) "extra" frames (each segment starts at 1 frame,
+    # i.e. 4*0+1) as whole 4-frame blocks so every count stays 4k+1
+    extra_blocks = (total_frames - N) // 4
+    base_k = extra_blocks // N
+    rem = extra_blocks % N
+    sizes = []
+    for i in range(N):
+        k = base_k + (1 if i < rem else 0)
+        sizes.append(4 * k + 1)
+    assert sum(sizes) == total_frames, (sum(sizes), total_frames)
+    return sizes
+
+
+def split_rts_into_segments(Rts, segment_frame_sizes):
+    """Split a (T,4,4) rail tensor into contiguous chunks of the given sizes.
+    Returns a list of tensors; their concatenation equals the input."""
+    segments = []
+    start = 0
+    for n in segment_frame_sizes:
+        segments.append(Rts[start:start + n])
+        start += n
+    assert start == len(Rts), (start, len(Rts))
+    return segments
+
+
+def generate_rail(depth, angle, movement_ratio, frame_size, mode="straight",
+                  liss_a=1, liss_b=2, liss_c=3, liss_A=None, liss_B=None, liss_C=None):
     print("generating rail...")
     device=depth.device
     H, W = depth.shape[:2]
@@ -1105,6 +1260,7 @@ def generate_rail(depth, angle, movement_ratio, frame_size, mode="straight"):
     z_axis = x_axis_ * math.sin(math.radians(angle)) + z_axis_ * math.cos(math.radians(angle))
     x_axis = z_axis_ * -math.sin(math.radians(angle)) + x_axis_ * math.cos(math.radians(angle))
     print(z_axis, x_axis)
+    l = depth_pvt * movement_ratio
     if mode == "straight":
         Rt0_ = torch.stack([x_axis,y_axis,z_axis],dim=0)
         Rt0 = torch.eye(4).float().to(device)
@@ -1112,6 +1268,68 @@ def generate_rail(depth, angle, movement_ratio, frame_size, mode="straight"):
         Rts = Rt0[None].repeat(frame_size,1,1)
         for i in range(frame_size):
             Rts[i,2,3] = -(depth_pvt * i *movement_ratio)/(frame_size-1)
+    # --- Linear (single-axis) motion: camera translates along one axis, keeps facing the same way ---
+    # Axis sign convention (rotated frame): +x=right, +y=up, +z=forward.
+    # Rt[:3,3] = -R @ t_world, so a positive world offset along an axis gives a negative Rt entry.
+    if mode in ("forward","rearward","left","right","up","down"):
+        axis_map = {"forward":(2,-1),"rearward":(2,1),"right":(0,-1),"left":(0,1),"up":(1,-1),"down":(1,1)}
+        ax, sgn = axis_map[mode]
+        Rt0_ = torch.stack([x_axis,y_axis,z_axis],dim=0)
+        Rt0 = torch.eye(4).float().to(device)
+        Rt0[:3,:3] = Rt0_
+        Rts = Rt0[None].repeat(frame_size,1,1)
+        for i in range(frame_size):
+            Rts[i,ax,3] = sgn * (depth_pvt * i *movement_ratio)/(frame_size-1)
+    # --- Lissajous: closed 3D curve, camera looks along the curve's tangent ---
+    # pos(t) = [A sin(a t), B sin(b t), C sin(c t)], t in [0, 2*pi].
+    # Integer a,b,c make the curve closed (pos(0)=pos(2*pi)=0).
+    if mode == "lissajous":
+        # Amplitudes in meters (world frame). Default to depth_pvt * movement_ratio
+        # so the sweep scales with the scene, matching the other rail modes.
+        A = depth_pvt * movement_ratio if liss_A is None else liss_A
+        B = depth_pvt * movement_ratio if liss_B is None else liss_B
+        C = depth_pvt * movement_ratio if liss_C is None else liss_C
+        Rt0_ = torch.stack([x_axis,y_axis,z_axis],dim=0)
+        Rt0 = torch.eye(4).float().to(device)
+        Rt0[:3,:3] = Rt0_
+        Rts = Rt0[None].repeat(frame_size,1,1)
+        prev_z = z_axis.clone()
+        for i in range(frame_size):
+            t = 2*math.pi*i/(frame_size-1)
+            px = A * math.sin(liss_a*t)
+            py = B * math.sin(liss_b*t)
+            pz = C * math.sin(liss_c*t)
+            tx = A*liss_a * math.cos(liss_a*t)
+            ty = B*liss_b * math.cos(liss_b*t)
+            tz = C*liss_c * math.cos(liss_c*t)
+            # tangent in world (panorama) frame
+            t_world = x_axis*tx + y_axis*ty + z_axis*tz
+            if t_world.norm() < 1e-6:
+                t_world = prev_z
+            prev_z = t_world
+            nx, ny, nz = _look_at(t_world, y_axis, device)
+            Rts[i,:3,:3] = torch.stack([nx,ny,nz],dim=0)
+            # translation: t = -R @ pos_world
+            pos_world = x_axis*px + y_axis*py + z_axis*pz
+            Rts[i,:3,3] = -(Rts[i,:3,:3] @ pos_world)
+    # --- Orbit: camera circles the room center (origin) in the horizontal plane, always facing the center ---
+    if mode == "orbit":
+        orbit_r = depth_pvt * movement_ratio
+        Rt0_ = torch.stack([x_axis,y_axis,z_axis],dim=0)
+        Rt0 = torch.eye(4).float().to(device)
+        Rt0[:3,:3] = Rt0_
+        Rts = Rt0[None].repeat(frame_size,1,1)
+        for i in range(frame_size):
+            theta = 2*math.pi*i/(frame_size-1)
+            px = orbit_r * math.sin(theta)
+            pz = orbit_r * math.cos(theta)
+            # look toward the center (origin): direction = -pos
+            z_dir = x_axis*(-px) + z_axis*(-pz)
+            nx, ny, nz = _look_at(z_dir, y_axis, device)
+            Rts[i,:3,:3] = torch.stack([nx,ny,nz],dim=0)
+            # translation: t = -R @ pos_world
+            pos_world = x_axis*px + z_axis*pz
+            Rts[i,:3,3] = -(Rts[i,:3,:3] @ pos_world)
     if mode == "s_curve":
         l = depth_pvt * movement_ratio
         sin_ratio = 0.15
@@ -1173,12 +1391,39 @@ def generate_rail(depth, angle, movement_ratio, frame_size, mode="straight"):
             cur_c2w[:3,3] = pos
             all_Rts.append(torch.linalg.inv(cur_c2w))
         Rts = torch.stack(all_Rts,axis=0)
+    if mode == "explore":
+        # Lissajous figure-8 in the x-z plane that starts and ends at the origin
+        # (so Rts[0] stays the identity) while sweeping forward, rearward, left,
+        # right and the diagonals. This gives the 3DGS training views from many
+        # directions, filling in holes that a straight forward path leaves behind.
+        l = depth_pvt * movement_ratio
+        A = l * 0.5   # lateral (left-right) amplitude
+        B = l * 0.5   # fore-aft (forward-rearward) amplitude
+        all_Rts = []
+        for i in range(frame_size):
+            t = 2 * math.pi * i / (frame_size - 1)
+            pos = x_axis * (A * math.sin(t)) + z_axis * (B * math.sin(2 * t))
+            # direction of motion (tangent); fall back to forward where it vanishes
+            direction_ = x_axis * (A * math.cos(t)) + z_axis * (2 * B * math.cos(2 * t))
+            if direction_.norm() < 1e-6:
+                direction = z_axis.clone()
+            else:
+                direction = direction_ / direction_.norm()
+            cur_z_axis = direction
+            cur_y_axis = y_axis
+            cur_x_axis = torch.cross(cur_y_axis, cur_z_axis)
+            cur_c2w = torch.eye(4).float().to(device)
+            cur_c2w[:3,:3] = torch.stack([cur_x_axis,cur_y_axis,cur_z_axis],dim=1)
+            cur_c2w[:3,3] = pos
+            all_Rts.append(torch.linalg.inv(cur_c2w))
+        Rts = torch.stack(all_Rts,axis=0)
     return Rts
 
         
 
 
-def perform_camera_movement_new(firstframe_rgb, firstframe_depth, angle=0., movement_ratio = 0.5, frame_size=81, preset_rail=None,mode="s_curve"):
+def perform_camera_movement_new(firstframe_rgb, firstframe_depth, angle=0., movement_ratio = 0.5, frame_size=81, preset_rail=None,mode="s_curve",
+                                liss_a=1, liss_b=2, liss_c=3, liss_A=None, liss_B=None, liss_C=None):
     '''device = firstframe_rgb.device
     depth_np = firstframe_depth.cpu().numpy()
     depth_np = depth_repair(depth_np)
@@ -1216,7 +1461,9 @@ def perform_camera_movement_new(firstframe_rgb, firstframe_depth, angle=0., move
     firstframe_depth = torch.cat([firstframe_depth[:,W//2:],firstframe_depth[:,:W//2]],dim=1)
 
     if preset_rail is None:
-        Rts = generate_rail(firstframe_depth, 0., movement_ratio, frame_size, mode=mode)
+        Rts = generate_rail(firstframe_depth, 0., movement_ratio, frame_size, mode=mode,
+                            liss_a=liss_a, liss_b=liss_b, liss_c=liss_c,
+                            liss_A=liss_A, liss_B=liss_B, liss_C=liss_C)
     else:
         Rts = preset_rail
     
@@ -1276,7 +1523,8 @@ def load_rail(json_path):
         d = json.load(F_)
     arr = np.array(d)
     return arr
-def perform_camera_movement_with_cam_input(firstframe_rgb, firstframe_depth, angle=0., movement_ratio = 0.5, frame_size=81, preset_rail=None,mode="s_curve"):
+def perform_camera_movement_with_cam_input(firstframe_rgb, firstframe_depth, angle=0., movement_ratio = 0.5, frame_size=81, preset_rail=None,mode="s_curve",
+                                           liss_a=1, liss_b=2, liss_c=3, liss_A=None, liss_B=None, liss_C=None):
 
     device = firstframe_depth.device
     depth_np = firstframe_depth.cpu().numpy()
@@ -1314,7 +1562,9 @@ def perform_camera_movement_with_cam_input(firstframe_rgb, firstframe_depth, ang
     firstframe_depth = torch.cat([firstframe_depth[:,W//2:],firstframe_depth[:,:W//2]],dim=1)
 
     if preset_rail is None:
-        Rts = generate_rail(firstframe_depth, 0., movement_ratio, frame_size, mode=mode)
+        Rts = generate_rail(firstframe_depth, 0., movement_ratio, frame_size, mode=mode,
+                            liss_a=liss_a, liss_b=liss_b, liss_c=liss_c,
+                            liss_A=liss_A, liss_B=liss_B, liss_C=liss_C)
     else:
         Rts = intersection_check(firstframe_depth,preset_rail_,0.5)
     
@@ -1324,6 +1574,56 @@ def perform_camera_movement_with_cam_input(firstframe_rgb, firstframe_depth, ang
         Rts[i,2,3] = -(depth_pvt * i *movement_ratio)/(frame_size-1)'''
     rgbs, masks = generate_pc_render(Rts, firstframe_rgb, firstframe_depth)
     return rgbs, masks, Rts, firstframe_rgb, firstframe_depth, angle
+
+def perform_camera_movement_with_cam_input_segmented(firstframe_rgb, firstframe_depth, angle=0., movement_ratio = 0.5, frame_size=81, preset_rail=None,mode="s_curve",
+                                           liss_a=1, liss_b=2, liss_c=3, liss_A=None, liss_B=None, liss_C=None,
+                                           segment_frame_sizes=None, out_dir=None, fps=12):
+    """Segmented version of perform_camera_movement_with_cam_input (Option A).
+
+    Builds the full rail (frame_size frames), then renders it in contiguous
+    segments so the per-segment GPU canvas tensor stays small. The panorama mesh
+    is built once and reused. Each segment is written to its own mp4 under
+    `out_dir`. Returns (seg_rgb_paths, seg_mask_paths, Rts, firstframe_rgb,
+    firstframe_depth, angle) -- the full Rts (not per-segment) so the caller can
+    concatenate the camera path.
+    """
+    device = firstframe_depth.device
+    depth_np = firstframe_depth.cpu().numpy()
+    depth_np = depth_repair(depth_np)
+    if preset_rail is not None:
+        if isinstance(preset_rail, np.ndarray):
+            preset_rail = torch.from_numpy(preset_rail).float().to(device)
+        firstframe_Rt = preset_rail[0]
+        firstframe_z = firstframe_Rt[2,:3]
+        firstframe_x = firstframe_Rt[0,:3]
+        original_z = torch.tensor([0,0,1.],dtype=torch.float32).to(device)
+        original_x = torch.tensor([1.,0,0],dtype=torch.float32).to(device)
+        cos_value = float((firstframe_z * original_z).sum())
+        sin_value = float((firstframe_z * original_x).sum())
+        angle_rad = math.acos(cos_value) if sin_value >=0 else 2 * math.pi - math.acos(cos_value)
+        angle = math.degrees(angle_rad)
+        preset_rail_ = preset_rail[...] @ torch.linalg.inv(preset_rail[0])[None]
+
+    W = firstframe_rgb.shape[1]
+    firstframe_depth = torch.from_numpy(depth_np).to(device)
+    q = int(angle/360. * W + W//2)%W
+    firstframe_rgb = torch.cat([firstframe_rgb[:,q:],firstframe_rgb[:,:q]],dim=1)
+    firstframe_depth = torch.cat([firstframe_depth[:,q:],firstframe_depth[:,:q]],dim=1)
+    firstframe_rgb = torch.cat([firstframe_rgb[:,W//2:],firstframe_rgb[:,:W//2]],dim=1)
+    firstframe_depth = torch.cat([firstframe_depth[:,W//2:],firstframe_depth[:,:W//2]],dim=1)
+
+    if preset_rail is None:
+        Rts = generate_rail(firstframe_depth, 0., movement_ratio, frame_size, mode=mode,
+                            liss_a=liss_a, liss_b=liss_b, liss_c=liss_c,
+                            liss_A=liss_A, liss_B=liss_B, liss_C=liss_C)
+    else:
+        Rts = intersection_check(firstframe_depth,preset_rail_,0.5)
+
+    if segment_frame_sizes is None:
+        segment_frame_sizes = [len(Rts)]
+    seg_rgb_paths, seg_mask_paths = render_rts_segmented(Rts, firstframe_rgb, firstframe_depth,
+                                                         segment_frame_sizes, out_dir, fps=fps)
+    return seg_rgb_paths, seg_mask_paths, Rts, firstframe_rgb, firstframe_depth, angle
 
 
 

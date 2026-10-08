@@ -4,8 +4,11 @@ import sys
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 sys.path.append("./DiffSynth-Studio")
 from diffsynth import ModelManager, WanVideoPipeline
-from utils_3dscene.nvrender import perform_camera_movement_with_cam_input, load_rail
-from utils_3dscene.pipeline_utils_3dscene import write_video
+from utils_3dscene.nvrender import (perform_camera_movement_with_cam_input,
+                                    perform_camera_movement_with_cam_input_segmented,
+                                    load_rail, lissajous_arc_length_3d, lissajous_frame_size,
+                                    lissajous_segment_frame_sizes)
+from utils_3dscene.pipeline_utils_3dscene import write_video, concat_videos_streaming
 from PIL import Image
 import imageio
 import argparse
@@ -233,6 +236,27 @@ def main(args):
     resolution = args.resolution
     is_720p = resolution == 720
 
+    # The base video is 81 frames (~3.4 s at 24 fps). For the Lissajous rail the
+    # camera must keep the same linear speed as the original movement, so the
+    # video duration scales with the curve length: the original movement covers
+    # `depth_pvt * movement_range` (t in [0, pi], no return to start) while the
+    # Lissajous curve (t in [0, 2*pi]) covers its full arc length. The amplitudes
+    # below mirror the defaults used by generate_rail (mode="lissajous").
+    base_frame_size = 81
+    liss_length = None
+    if movement_mode == "lissajous":
+        # Compute the curve arc length now (in meters when explicit amplitudes
+        # are given). The frame size itself is recomputed after the depth map is
+        # loaded, because the original movement length depends on `depth_pvt`
+        # (the scene scale, in meters), which is only known then.
+        _liss_A = args.liss_A if args.liss_A is not None else movement_range
+        _liss_B = args.liss_B if args.liss_B is not None else movement_range
+        _liss_C = args.liss_C if args.liss_C is not None else movement_range
+        liss_length = lissajous_arc_length_3d(_liss_A, _liss_B, _liss_C, args.liss_a, args.liss_b, args.liss_c)
+        frame_size = base_frame_size  # placeholder; recomputed after depth load
+    else:
+        frame_size = base_frame_size
+
     if is_720p:
         if not use_5b_model:
             snapshot_download("Wan-AI/Wan2.1-I2V-14B-720P", local_dir="checkpoints/Wan-AI/Wan2.1-I2V-14B-720P")
@@ -243,6 +267,8 @@ def main(args):
     device = f"cuda:{dist.get_rank()}"
     case_dir = os.path.abspath(output_dir)#os.path.abspath(os.path.join(output_dir, panorama_name))
     os.makedirs(case_dir,exist_ok=True)
+    condition_dir = os.path.join(case_dir,"condition")
+    os.makedirs(condition_dir, exist_ok=True)
     print(f"panorama_path={panorama_path}")
     panorama = cv2.resize(cv2.imread(panorama_path, cv2.IMREAD_UNCHANGED),(2048,1024),interpolation=cv2.INTER_AREA)
     input_image_path = os.path.join(case_dir, "moge.png")
@@ -258,25 +284,78 @@ def main(args):
         valid_max = depth[mask].max()
         depth[~mask] = 2. * valid_max
 
+        # Recompute the Lissajous frame size now that the depth (and thus the
+        # scene scale `depth_pvt`, in meters) is known. The original straight
+        # movement covers `depth_pvt * movement_range` meters, so both the
+        # Lissajous arc length and the original length must be in meters for
+        # the speed-matching ratio to be correct. (The estimate computed earlier
+        # used a unitless `movement_range` as the original length, which
+        # over-scales the frame count by a factor of `depth_pvt`.)
+        if movement_mode == "lissajous":
+            _H, _W = depth.shape[:2]
+            # Match the rail's depth_pvt: the rail rotates the depth so the
+            # camera's forward column (pvt) is centered, then samples the
+            # center column. That equals the unrotated depth at column pvt.
+            _pvt = int(angle/360. * _W + _W//2) % _W
+            depth_pvt = float(depth[_H//2, _pvt])
+            original_length = depth_pvt * movement_range
+            frame_size = lissajous_frame_size(base_frame_size, liss_length, original_length)
+            print(f"[lissajous] depth_pvt = {depth_pvt:.4f} m -> original length = {original_length:.4f} m -> "
+                  f"video duration x{liss_length / original_length:.2f} -> {frame_size} frames "
+                  f"({frame_size / 24.0:.2f} s at 24 fps)")
+
         panorama_torch = (torch.from_numpy(panorama).float()/255.).to("cuda")
         depth_torch = torch.from_numpy(depth).float().to("cuda")
         mask_torch = torch.from_numpy(mask).bool().to("cuda")
-        
+
+        use_segmentation = False
         if len(args.json_path) > 0 and os.path.exists(args.json_path):
             rail = load_rail(args.json_path)
         else:
             rail = None
-        rendered_rgb, rendered_mask, render_Rts, firstframe_rgb, firstframe_depth, angle = perform_camera_movement_with_cam_input(panorama_torch, depth_torch, angle=angle, movement_ratio=movement_range, frame_size=81, preset_rail=rail,mode=movement_mode)
 
-    condition_dir = os.path.join(case_dir,"condition")
-    os.makedirs(condition_dir, exist_ok=True)
+        # Option A: for a long Lissajous rail, split it into ~81-frame segments so
+        # each render + Wan pass stays within the target VRAM (the full rail would
+        # otherwise allocate a (frame_size, H, W, 3) GPU tensor that OOMs). The
+        # segments tile the rail exactly, so concatenating them reproduces the full
+        # video and the full camera path.
+        use_segmentation = (movement_mode == "lissajous" and rail is None
+                            and frame_size > base_frame_size)
+        segment_frame_sizes = None
+        seg_rgb_paths = seg_mask_paths = None
+        if use_segmentation:
+            segment_frame_sizes = lissajous_segment_frame_sizes(
+                frame_size, base_frame_size,
+                num_segments=(args.liss_segments if args.liss_segments > 0 else None))
+            print(f"[lissajous] Option A: splitting {frame_size}-frame rail into "
+                  f"{len(segment_frame_sizes)} segments {segment_frame_sizes}")
+            seg_rgb_paths, seg_mask_paths, render_Rts, firstframe_rgb, firstframe_depth, angle = \
+                perform_camera_movement_with_cam_input_segmented(
+                    panorama_torch, depth_torch, angle=angle, movement_ratio=movement_range,
+                    frame_size=frame_size, preset_rail=rail, mode=movement_mode,
+                    liss_a=args.liss_a, liss_b=args.liss_b, liss_c=args.liss_c,
+                    liss_A=args.liss_A, liss_B=args.liss_B, liss_C=args.liss_C,
+                    segment_frame_sizes=segment_frame_sizes, out_dir=condition_dir, fps=12)
+            rendered_rgb = rendered_mask = None
+        else:
+            rendered_rgb, rendered_mask, render_Rts, firstframe_rgb, firstframe_depth, angle = perform_camera_movement_with_cam_input(panorama_torch, depth_torch, angle=angle, movement_ratio=movement_range, frame_size=frame_size, preset_rail=rail,mode=movement_mode,
+                liss_a=args.liss_a, liss_b=args.liss_b, liss_c=args.liss_c,
+                liss_A=args.liss_A, liss_B=args.liss_B, liss_C=args.liss_C)
+
     camera_path = os.path.join(condition_dir, "cameras.npz")
     if dist.get_rank() == 0:
-        rendered_rgb_np = (rendered_rgb.cpu().numpy() * 255.).astype(np.uint8)
-        rendered_mask_np = (rendered_mask.float()[:,:,:,None].repeat(1,1,1,3).cpu().numpy() * 255.).astype(np.uint8)
+        if use_segmentation:
+            # Segments were already written to disk by the segmented render.
+            # Concatenate them (streaming, one frame at a time) into the single
+            # condition videos the rest of the pipeline expects.
+            concat_videos_streaming(seg_rgb_paths, os.path.join(condition_dir,"rendered_rgb.mp4"), 12)
+            concat_videos_streaming(seg_mask_paths, os.path.join(condition_dir,"rendered_mask.mp4"), 12)
+        else:
+            rendered_rgb_np = (rendered_rgb.cpu().numpy() * 255.).astype(np.uint8)
+            rendered_mask_np = (rendered_mask.float()[:,:,:,None].repeat(1,1,1,3).cpu().numpy() * 255.).astype(np.uint8)
 
-        write_video(rendered_rgb_np, os.path.join(condition_dir,"rendered_rgb.mp4"), 12)
-        write_video(rendered_mask_np, os.path.join(condition_dir,"rendered_mask.mp4"), 12)
+            write_video(rendered_rgb_np, os.path.join(condition_dir,"rendered_rgb.mp4"), 12)
+            write_video(rendered_mask_np, os.path.join(condition_dir,"rendered_mask.mp4"), 12)
 
         W = firstframe_rgb.shape[1]
         q = int(angle/360. * W + W//2)%W
@@ -358,70 +437,82 @@ def main(args):
             pipe.enable_vram_management(num_persistent_param_in_dit=None)
 
 
-    if not use_5b_model:
-        #vid_path, mask_path,text,
-        tgt_resolution = (1440,720) if is_720p else (960,480)
-        #dset = TextVideoDataset(vid_path = os.path.join(condition_dir,"rendered_rgb.mp4"), mask_path = os.path.join(condition_dir,"rendered_mask.mp4"), text=prompt)
-        # (self, vid_path, mask_path,text, max_num_frames=81, frame_interval=1, num_frames=81, height=720, width=1440, is_i2v=True):
-        dset = TextVideoDataset(vid_path = os.path.join(condition_dir,"rendered_rgb.mp4"), mask_path = os.path.join(condition_dir,"rendered_mask.mp4"), text=prompt, height=tgt_resolution[1],width=tgt_resolution[0])
-        cases = dset[0]
-        prompt = cases["text"]
-        cond_video = ((cases["masked_video"].permute(1,2,3,0) + 1.) / 2. * 255.).cpu().numpy()
-        cond_mask = ((cases["mask_video"].permute(1,2,3,0) + 1.) / 2. * 255.).cpu().numpy()
-        #print(prompt[i])
-        video = pipe(
-            prompt=prompt+" The video is of high quality, and the view is very clear. High quality, masterpiece, best quality, highres, ultra-detailed, fantastic.",
-            negative_prompt="The video is not of a high quality, it has a low resolution. Distortion. strange artifacts.",
-            cfg_scale=5.0,
-            num_frames=81,
-            num_inference_steps=50,
-            seed=seed, tiled=True,
-            height=tgt_resolution[1],
-            width=tgt_resolution[0],
-            cond_video = cond_video,
-            cond_mask = cond_mask
-        )
-    else:
-        tgt_resolution = (1408,704)
-        height = tgt_resolution[1]
-        width = tgt_resolution[0]
-        # TODO: add no-csv input support;
-        condition_info = [
-            {
-                "video":os.path.join(condition_dir,"rendered_rgb.mp4"),
-                "cond_video":os.path.join(condition_dir,"rendered_rgb.mp4"),
-                "cond_mask":os.path.join(condition_dir,"rendered_mask.mp4"),
-                "prompt":prompt
-            }
-        ]
-        dset = VideoDataset(
-            #base_path="/", metadata_path="/datasets_3d/zhongqi.yang/matrix3d_inference/dataset/metadata_1k.csv",
-            base_path="/", metadata_path=None,
-            num_frames=81,
-            time_division_factor=4, time_division_remainder=1,
-            max_pixels=height*width, height=height, width=width,
-            height_division_factor=16, width_division_factor=16,
-            data_file_keys=("video","cond_video","cond_mask"),
-            image_file_extension=("jpg", "jpeg", "png", "webp"),
-            video_file_extension=("mp4", "avi", "mov", "wmv", "mkv", "flv", "webm"),
-            repeat=1,
-            args=None,
-            raw_dict=condition_info
-        )
-        cases = dset[0]
+    def run_wan(vid_path, mask_path, n_frames):
+        """Run one Wan pass over a condition video of `n_frames` frames and return
+        the list of generated frames. Used once for the non-segmented case and once
+        per segment for Option A (the model/pipe is loaded once, outside this fn)."""
+        if not use_5b_model:
+            tgt_resolution = (1440,720) if is_720p else (960,480)
+            dset = TextVideoDataset(vid_path = vid_path, mask_path = mask_path, text=prompt, max_num_frames=n_frames, num_frames=n_frames, height=tgt_resolution[1],width=tgt_resolution[0])
+            cases = dset[0]
+            cond_video = ((cases["masked_video"].permute(1,2,3,0) + 1.) / 2. * 255.).cpu().numpy()
+            cond_mask = ((cases["mask_video"].permute(1,2,3,0) + 1.) / 2. * 255.).cpu().numpy()
+            return pipe(
+                prompt=prompt+" The video is of high quality, and the view is very clear. High quality, masterpiece, best quality, highres, ultra-detailed, fantastic.",
+                negative_prompt="The video is not of a high quality, it has a low resolution. Distortion. strange artifacts.",
+                cfg_scale=5.0,
+                num_frames=n_frames,
+                num_inference_steps=50,
+                seed=seed, tiled=True,
+                height=tgt_resolution[1],
+                width=tgt_resolution[0],
+                cond_video = cond_video,
+                cond_mask = cond_mask
+            )
+        else:
+            tgt_resolution = (1408,704)
+            height = tgt_resolution[1]
+            width = tgt_resolution[0]
+            # TODO: add no-csv input support;
+            condition_info = [
+                {
+                    "video":vid_path,
+                    "cond_video":vid_path,
+                    "cond_mask":mask_path,
+                    "prompt":prompt
+                }
+            ]
+            dset = VideoDataset(
+                #base_path="/", metadata_path="/datasets_3d/zhongqi.yang/matrix3d_inference/dataset/metadata_1k.csv",
+                base_path="/", metadata_path=None,
+                num_frames=n_frames,
+                time_division_factor=4, time_division_remainder=1,
+                max_pixels=height*width, height=height, width=width,
+                height_division_factor=16, width_division_factor=16,
+                data_file_keys=("video","cond_video","cond_mask"),
+                image_file_extension=("jpg", "jpeg", "png", "webp"),
+                video_file_extension=("mp4", "avi", "mov", "wmv", "mkv", "flv", "webm"),
+                repeat=1,
+                args=None,
+                raw_dict=condition_info
+            )
+            cases = dset[0]
 
-        video_ori = pipe(
-            prompt=cases['prompt'] + " The video is of high quality, and the view is very clear. High quality, masterpiece, best quality, highres, ultra-detailed, fantastic.",
-            negative_prompt="The video is not of a high quality, it has a low resolution. Distortion. strange artifacts. flickering. worst quality. low quality",
-            seed=120, tiled=True,
-            height=height, width=width,
-            input_image=cases["video"][0],
-            num_frames=81,
-            cond_video = (cases["cond_video"]),
-            cond_mask = (cases["cond_mask"]),
-        )
-        # the original resolution of 5b model is actually [704,1408], in order to be unified with latter steps, we resize the output to [720,1440].
-        video = [img.resize((1440,720)) for img in video_ori]
+            video_ori = pipe(
+                prompt=cases['prompt'] + " The video is of high quality, and the view is very clear. High quality, masterpiece, best quality, highres, ultra-detailed, fantastic.",
+                negative_prompt="The video is not of a high quality, it has a low resolution. Distortion. strange artifacts. flickering. worst quality. low quality",
+                seed=120, tiled=True,
+                height=height, width=width,
+                input_image=cases["video"][0],
+                num_frames=n_frames,
+                cond_video = (cases["cond_video"]),
+                cond_mask = (cases["cond_mask"]),
+            )
+            # the original resolution of 5b model is actually [704,1408], in order to be unified with latter steps, we resize the output to [720,1440].
+            return [img.resize((1440,720)) for img in video_ori]
+
+    if use_segmentation:
+        # Option A: generate each ~81-frame segment separately (fits VRAM), then
+        # concatenate the per-segment frames into the full video.
+        video = []
+        for k in range(len(segment_frame_sizes)):
+            print(f"[lissajous] generating segment {k+1}/{len(segment_frame_sizes)} ({segment_frame_sizes[k]} frames)")
+            seg_frames = run_wan(seg_rgb_paths[k], seg_mask_paths[k], segment_frame_sizes[k])
+            video.extend(seg_frames)
+            del seg_frames
+            torch.cuda.empty_cache()
+    else:
+        video = run_wan(os.path.join(condition_dir,"rendered_rgb.mp4"), os.path.join(condition_dir,"rendered_mask.mp4"), frame_size)
 
     if dist.get_rank() == 0:
         generated_dir = os.path.join(case_dir,"generated")
@@ -429,7 +520,7 @@ def main(args):
         
         os.makedirs(generated_dir, exist_ok=True)
         result = []
-        for j in range(81):
+        for j in range(len(video)):
             generated_image = np.array(video[j])[:,:,::-1]
             result.append(generated_image)
         write_video(result, generated_path, 24)
@@ -450,12 +541,20 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--angle", type=float, default=0., help="the azimuth angle of camera movement direction. angle=0 means the camera moves towards the center of the panoramic image, angle=90 means the camera moves towards the middle-right direction of the panoramic image")
-    parser.add_argument("--movement_range", type=float, default=0.6, help="relative movement range of the camera w.r.t the estimated depth of the input panorama. the value should be between 0~0.8")
-    parser.add_argument("--movement_mode", type=str, default="straight", help="the shape of the rail along which the camera moves. choose between ['s_curve','l_curve','r_curve','straight']")
-    parser.add_argument("--json_path", type=str, default="", help="predefined camera path. the predefined camera is stored as json file in the format defined in code/generate_example_camera.py")#######2025-6-13
+    parser.add_argument("--movement_range", "--movement-range", type=float, default=0.6, help="relative movement range of the camera w.r.t the estimated depth of the input panorama. the value should be between 0~0.8")
+    parser.add_argument("--movement_mode", "--movement-mode", type=str, default="straight", help="the shape of the rail along which the camera moves. choose between ['s_curve','l_curve','r_curve','straight','lissajous']")
+    parser.add_argument("--liss_a", "--liss-a", type=int, default=1, help="lissajous frequency a (integer >= 1)")
+    parser.add_argument("--liss_b", "--liss-b", type=int, default=2, help="lissajous frequency b (integer >= 1)")
+    parser.add_argument("--liss_c", "--liss-c", type=int, default=3, help="lissajous frequency c (integer >= 1)")
+    parser.add_argument("--liss_A", "--liss-A", type=float, default=None, help="lissajous amplitude A in meters (default: movement_range)")
+    parser.add_argument("--liss_B", "--liss-B", type=float, default=None, help="lissajous amplitude B in meters (default: movement_range)")
+    parser.add_argument("--liss_C", "--liss-C", type=float, default=None, help="lissajous amplitude C in meters (default: movement_range)")
+    parser.add_argument("--liss_segments", "--liss-segments", type=int, default=0,
+                        help="Option A: split the (long) Lissajous rail into this many segments, each rendered + generated in its own low-memory pass and then concatenated. 0 (default) = auto: choose the segment count so each segment is ~81 frames (the size that fits the target hardware). Only used when movement_mode=lissajous and the rail is longer than one segment.")
+    parser.add_argument("--json_path", "--json-path", type=str, default="", help="predefined camera path. the predefined camera is stored as json file in the format defined in code/generate_example_camera.py")#######2025-6-13
     parser.add_argument("--seed", type=int, default=0, help="the generation seed")
     parser.add_argument("--resolution", type=int, default=720, help="the working resolution of the panoramic video generation model.")
-    parser.add_argument("--inout_dir", type=str, default="./output/example1")
+    parser.add_argument("--inout_dir", "--inout-dir", type=str, default="./output/example1")
     parser.add_argument("--use_5b_model", action="store_true", help="whether to use 5b model to train things.")
     parser.add_argument("--enable_vram_management", action="store_true", help="whether to enable vram management for running on low mem devices.")
     args = parser.parse_args()
