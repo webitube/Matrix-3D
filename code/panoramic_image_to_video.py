@@ -254,6 +254,12 @@ def main(args):
         _liss_C = args.liss_C if args.liss_C is not None else movement_range
         liss_length = lissajous_arc_length_3d(_liss_A, _liss_B, _liss_C, args.liss_a, args.liss_b, args.liss_c)
         frame_size = base_frame_size  # placeholder; recomputed after depth load
+    elif movement_mode == "cross":
+        # 4 straight legs (forward, rearward, left, right), each the length of the
+        # original straight run -> 4 * base_frame_size frames total. No arc-length
+        # computation needed; the legs tile the rail into 4 segments of
+        # base_frame_size frames each (each a valid Wan count, 4k+1).
+        frame_size = 4 * base_frame_size
     else:
         frame_size = base_frame_size
 
@@ -314,12 +320,12 @@ def main(args):
         else:
             rail = None
 
-        # Option A: for a long Lissajous rail, split it into ~81-frame segments so
-        # each render + Wan pass stays within the target VRAM (the full rail would
-        # otherwise allocate a (frame_size, H, W, 3) GPU tensor that OOMs). The
-        # segments tile the rail exactly, so concatenating them reproduces the full
-        # video and the full camera path.
-        use_segmentation = (movement_mode == "lissajous" and rail is None
+        # Option A: for a long rail (Lissajous or cross), split it into ~81-frame
+        # segments so each render + Wan pass stays within the target VRAM (the full
+        # rail would otherwise allocate a (frame_size, H, W, 3) GPU tensor that
+        # OOMs). The segments tile the rail exactly, so concatenating them
+        # reproduces the full video and the full camera path.
+        use_segmentation = (movement_mode in ("lissajous", "cross") and rail is None
                             and frame_size > base_frame_size)
         segment_frame_sizes = None
         seg_rgb_paths = seg_mask_paths = None
@@ -327,7 +333,7 @@ def main(args):
             segment_frame_sizes = lissajous_segment_frame_sizes(
                 frame_size, base_frame_size,
                 num_segments=(args.liss_segments if args.liss_segments > 0 else None))
-            print(f"[lissajous] Option A: splitting {frame_size}-frame rail into "
+            print(f"[{movement_mode}] Option A: splitting {frame_size}-frame rail into "
                   f"{len(segment_frame_sizes)} segments {segment_frame_sizes}")
             seg_rgb_paths, seg_mask_paths, render_Rts, firstframe_rgb, firstframe_depth, angle = \
                 perform_camera_movement_with_cam_input_segmented(
@@ -506,7 +512,7 @@ def main(args):
         # concatenate the per-segment frames into the full video.
         video = []
         for k in range(len(segment_frame_sizes)):
-            print(f"[lissajous] generating segment {k+1}/{len(segment_frame_sizes)} ({segment_frame_sizes[k]} frames)")
+            print(f"[{movement_mode}] generating segment {k+1}/{len(segment_frame_sizes)} ({segment_frame_sizes[k]} frames)")
             seg_frames = run_wan(seg_rgb_paths[k], seg_mask_paths[k], segment_frame_sizes[k])
             video.extend(seg_frames)
             del seg_frames
@@ -542,7 +548,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--angle", type=float, default=0., help="the azimuth angle of camera movement direction. angle=0 means the camera moves towards the center of the panoramic image, angle=90 means the camera moves towards the middle-right direction of the panoramic image")
     parser.add_argument("--movement_range", "--movement-range", type=float, default=0.6, help="relative movement range of the camera w.r.t the estimated depth of the input panorama. the value should be between 0~0.8")
-    parser.add_argument("--movement_mode", "--movement-mode", type=str, default="straight", help="the shape of the rail along which the camera moves. choose between ['s_curve','l_curve','r_curve','straight','lissajous']")
+    parser.add_argument("--movement_mode", "--movement-mode", type=str, default="straight", help="the shape of the rail along which the camera moves. choose between ['s_curve','l_curve','r_curve','straight','lissajous','cross']. 'cross' = 4 straight legs (forward, rearward, left, right) each the length of the original straight run, camera facing the direction of travel on each leg.")
     parser.add_argument("--liss_a", "--liss-a", type=int, default=1, help="lissajous frequency a (integer >= 1)")
     parser.add_argument("--liss_b", "--liss-b", type=int, default=2, help="lissajous frequency b (integer >= 1)")
     parser.add_argument("--liss_c", "--liss-c", type=int, default=3, help="lissajous frequency c (integer >= 1)")
@@ -550,7 +556,7 @@ if __name__ == "__main__":
     parser.add_argument("--liss_B", "--liss-B", type=float, default=None, help="lissajous amplitude B in meters (default: movement_range)")
     parser.add_argument("--liss_C", "--liss-C", type=float, default=None, help="lissajous amplitude C in meters (default: movement_range)")
     parser.add_argument("--liss_segments", "--liss-segments", type=int, default=0,
-                        help="Option A: split the (long) Lissajous rail into this many segments, each rendered + generated in its own low-memory pass and then concatenated. 0 (default) = auto: choose the segment count so each segment is ~81 frames (the size that fits the target hardware). Only used when movement_mode=lissajous and the rail is longer than one segment.")
+                        help="Option A: split the (long) Lissajous or cross rail into this many segments, each rendered + generated in its own low-memory pass and then concatenated. 0 (default) = auto: choose the segment count so each segment is ~81 frames (the size that fits the target hardware). Only used when movement_mode is lissajous or cross and the rail is longer than one segment.")
     parser.add_argument("--json_path", "--json-path", type=str, default="", help="predefined camera path. the predefined camera is stored as json file in the format defined in code/generate_example_camera.py")#######2025-6-13
     parser.add_argument("--seed", type=int, default=0, help="the generation seed")
     parser.add_argument("--resolution", type=int, default=720, help="the working resolution of the panoramic video generation model.")

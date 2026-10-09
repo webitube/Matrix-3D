@@ -1417,6 +1417,33 @@ def generate_rail(depth, angle, movement_ratio, frame_size, mode="straight",
             cur_c2w[:3,3] = pos
             all_Rts.append(torch.linalg.inv(cur_c2w))
         Rts = torch.stack(all_Rts,axis=0)
+    # --- Cross: 4 straight legs (forward, rearward, left, right), each starting at
+    # the center (origin) and moving outward, camera facing the direction of travel.
+    # This gives 3DGS training views from 4 directions of the room in ~4x the frames
+    # of a single straight run (vs ~16x for the full Lissajous). Each leg is
+    # `frame_size // 4` frames; with frame_size = 4 * 81 the legs tile the rail into
+    # four 81-frame segments (each a valid Wan count, 4k+1). The camera teleports
+    # back to the center between legs, which is fine because each segment is an
+    # independent Wan I2V pass whose first frame is the rendered center view.
+    if mode == "cross":
+        leg_len = max(1, frame_size // 4)
+        # (world axis, direction sign): +z=forward, -z=rearward, +x=left, -x=right
+        legs = [(z_axis, 1), (z_axis, -1), (x_axis, 1), (x_axis, -1)]
+        Rts = torch.eye(4).float().to(device)[None].repeat(frame_size, 1, 1)
+        for k, (axis, sgn) in enumerate(legs):
+            leg_start = k * leg_len
+            look_dir = axis * sgn  # direction of travel for this leg
+            nx, ny, nz = _look_at(look_dir, y_axis, device)
+            for i in range(leg_len):
+                gi = leg_start + i
+                # camera position in world: center (i=0) -> full extent (i=leg_len-1)
+                d = (depth_pvt * i * movement_ratio) / (leg_len - 1) if leg_len > 1 else 0.
+                pos_world = axis * (sgn * d)
+                Rts[gi, :3, :3] = torch.stack([nx, ny, nz], dim=0)
+                # translation: t = -R @ pos_world
+                Rts[gi, :3, 3] = -(Rts[gi, :3, :3] @ pos_world)
+        # Frame 0 (forward leg, i=0) is at the center facing forward == identity,
+        # matching the clean first frame that render_rts_segmented overwrites anyway.
     return Rts
 
         
