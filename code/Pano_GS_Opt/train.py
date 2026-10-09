@@ -37,6 +37,56 @@ import time
 from utils.vis_utils import apply_depth_colormap, save_points, colormap
 from utils.depth_utils import depths_to_points, depth_to_normal
 
+
+def _system_ram_gb():
+    """Return (used_gb, total_gb) of system RAM, or (None, None) if unavailable.
+    Tries psutil first, then falls back to /proc/meminfo (works in WSL/Linux)."""
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+        return vm.used / 1e9, vm.total / 1e9
+    except Exception:
+        pass
+    try:
+        info = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                key, _, rest = line.partition(":")
+                info[key.strip()] = rest.strip()
+        total_kb = float(info["MemTotal"])
+        avail_kb = float(info.get("MemAvailable", info.get("MemFree", 0)))
+        used_kb = total_kb - avail_kb
+        return used_kb / 1e6, total_kb / 1e6
+    except Exception:
+        return None, None
+
+
+def log_memory_usage(iteration, gaussians, device=None, n_points=None):
+    """Print a one-line memory snapshot: dedicated VRAM (allocated/reserved),
+    system RAM (used/total), and the current Gaussian point count.
+
+    Correlating these with the training progress lets you spot the Shared-VRAM
+    spillover: when VRAM reserved plateaus near the card's capacity (e.g. 24 GB)
+    and system RAM used climbs, the GPU is borrowing system RAM over PCIe.
+    """
+    if n_points is None:
+        n_points = gaussians.get_xyz.shape[0]
+    if device is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    try:
+        alloc_gb = torch.cuda.memory_allocated(device) / 1e9
+        resv_gb = torch.cuda.memory_reserved(device) / 1e9
+    except Exception:
+        alloc_gb = resv_gb = float("nan")
+    ram_used, ram_total = _system_ram_gb()
+    pts = f"{n_points / 1e6:.2f}M"
+    if ram_used is not None:
+        ram_str = f"RAM used={ram_used:.1f}/{ram_total:.1f}GB ({100 * ram_used / ram_total:.0f}%)"
+    else:
+        ram_str = "RAM n/a"
+    print(f"[MEM iter={iteration}] pts={pts} | VRAM alloc={alloc_gb:.1f}GB resv={resv_gb:.1f}GB | {ram_str}")
+
+
 @torch.no_grad()
 def create_offset_gt(image, offset):
     height, width = image.shape[1:]
@@ -88,7 +138,7 @@ def L1_loss_appearance(image, gt_image, gaussians, view_idx, return_transformed_
         return transformed_image
 # 假如纯给gs上色，它会怎么样？
 #
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, log_memory_interval=100):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
@@ -196,6 +246,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
+
+            # Periodic memory snapshot (VRAM + system RAM + point count) so the
+            # Shared-VRAM spillover can be correlated with training progress.
+            if log_memory_interval > 0 and iteration % log_memory_interval == 0:
+                log_memory_usage(iteration, gaussians)
 
             # Log and save
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, dataset.kernel_size))
@@ -311,6 +366,8 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--device", type=str, default = "cuda:0")
+    parser.add_argument("--log_memory_interval", type=int, default=100,
+                        help="log dedicated VRAM + system RAM + point count every N iterations (0 disables)")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -327,7 +384,7 @@ if __name__ == "__main__":
     # # Start GUI server, configure and run training
     # network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.log_memory_interval)
 
     # All done
     print("\nTraining complete.")

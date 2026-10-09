@@ -21,6 +21,7 @@ import cv2
 # from realesrgan import RealESRGANer
 # from realesrgan.archs.srvgg_arch import SRVGGNetCompact
 import shutil
+import time
 
 import trimesh
 OPTIMAL_SPLIT_FRAME_SIZE = 49
@@ -88,6 +89,19 @@ def main(args):
     last_optimized_Rt = []
     # import pdb
     # pdb.set_trace()
+
+    # Progress + ETA for the per-frame MoGe depth phase (the long, previously
+    # silent part of Step 3). Only frames that are NOT anchors and fall on the
+    # depth_estimation_interval actually run MoGe; count those up front so the
+    # "step k/K" and ETA are meaningful.
+    moge_steps = [i for i in range(N)
+                  if i not in anchor_frame_indices and i % depth_estimation_interval == 0]
+    K_moge = len(moge_steps)
+    moge_step_idx = 0
+    depth_t0 = time.time()
+    print(f"[depth] {N} frames total, {K_moge} MoGe depth steps "
+          f"(every {depth_estimation_interval} frames, anchors={anchor_frame_indices})")
+
     for i in range(N):
         if i in anchor_frame_indices:
             cur_frame = video_frames[i]
@@ -125,6 +139,13 @@ def main(args):
             input_image_path = os.path.join(moge_output_dir, "input.png")
             cv2.imwrite(input_image_path, cv2.resize(cur_frame,(width,height)))
             print(width, height)
+            # Progress + ETA for this MoGe depth step.
+            moge_step_idx += 1
+            elapsed = time.time() - depth_t0
+            avg = elapsed / moge_step_idx
+            eta = avg * (K_moge - moge_step_idx)
+            print(f"[depth] MoGe step {moge_step_idx}/{K_moge} (frame {i}/{N}) | "
+                  f"elapsed {elapsed / 60.0:.1f}m | ETA {eta / 60.0:.1f}m")
             os.system(f"cd code/MoGe && python scripts/infer_panorama.py --input {input_image_path} --output {moge_output_dir} --pretrained {moge_model_path} --device {device} --threshold 0.03 --maps --ply --resolution_level 6")
             print(f"moge_output_dir={moge_output_dir}")
             depth_dir = os.path.join(moge_output_dir, "input")
@@ -165,7 +186,9 @@ def main(args):
             last_optimized_depth.append(cv2.resize(optimized_depth,(width, height)))
             last_optimized_mask.append(cv2.resize(optimized_mask.astype(np.uint8)*255,(width, height))>127)
             last_optimized_Rt.append(cur_camera)
-                
+
+    print(f"[depth] done: {K_moge} MoGe steps in {(time.time() - depth_t0) / 60.0:.1f}m")
+
 if __name__ == "__main__":
     '''
         device = args.device

@@ -55,6 +55,7 @@ There is **no test suite**. Verify changes with `py_compile` / `bash -n` and, wh
 ### Do NOT modify (vendored black boxes)
 
 - `code/DiffSynth-Studio/`, `code/MoGe/`, `code/StableSR/`, `code/VideoSR/`, `code/Pano_GS_Opt/`, `code/Pano_LRM/`, `code/pano_init/`
+  - Small Exception: `code/Pano_GS_Opt/train.py`: Small modifications to add memory and progress logging.
 - `submodules/` (CUDA C++ extensions: nvdiffrast, simple-knn, diff-gaussian-rasterization-w-pose, ODGS)
 - `checkpoints/`, `models/`, `output/`, `data/` (weights and artifacts, not source)
 
